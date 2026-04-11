@@ -1,0 +1,1479 @@
+// Uses Adafruit_ILI9341 + U8g2_for_Adafruit_GFX for Cyrillic
+// Arduino Mega2560 + 2.8" 320x240 TFT (ILI9341)
+// Optimized partial redraw for fast scrolling
+// UPDATED: UpdateCountdown now uses per-digit partial redraws
+//          → only the digits that actually change are cleared + redrawn.
+//          This eliminates the full-area black flash every second → no more visible flicker.
+// FURTHER UPDATED: To fix colon not displaying after first sequence:
+//          - Added forceFull parameter to UpdateCountdown to force redraw of all characters when screen is refreshed.
+//          - Moved initial UpdateCountdown call out of DisplayTreatInProgressScreen and into GenerateFrequency after each screen refresh.
+//          - Now passes current elapsedMs for accurate initial remaining time (fixes bug where it always showed full time briefly).
+//          - Removed static firstDraw as forceFull handles it.
+#include <EEPROM.h>
+#include <AD9833.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <U8g2_for_Adafruit_GFX.h>
+
+#define DEBUG 0
+#if DEBUG == 1
+  #define debug(x) Serial.print(x)
+  #define debugln(x) Serial.println(x)
+#else
+  #define debug(x)
+  #define debugln(x)
+#endif
+
+#define SETTINGS_FILE "settings.txt"
+
+//  LIMITS 
+#define MAX_DIAGNOSES 64
+#define MAX_NAME_LEN  32
+
+//  DISPLAY 
+#define TFT_CS          53
+#define TFT_DC          48
+#define TFT_RST         49
+
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+U8G2_FOR_ADAFRUIT_GFX u8g2gfx;
+
+// Gold color palette
+#define GOLD1  tft.color565(255, 215, 0)
+#define GOLD2  tft.color565(218, 165, 32)
+#define GOLD3  tft.color565(184, 134, 11)
+#define GOLD4  tft.color565(255, 236, 139)
+
+//  AD9833 
+#define pinGenCS         9
+AD9833 gen(pinGenCS);
+#define pinSDCard_CS    10
+// Pins
+#define pinEncoderCW     2
+#define pinEncoderCCW    3
+#define pinBeepOut       4
+#define pinShutdown2     5
+#define pinShutdown1     6
+#define pinBtnEnter     21
+#define pinBatteryLevel A0
+
+//  RUNTIME DATA 
+char diagnoses[MAX_DIAGNOSES][MAX_NAME_LEN];
+int  frequencies[MAX_DIAGNOSES][10];
+int  numberOfDiagnoses = 0;
+
+char treatmentTime[4] = "20";
+char language[10]     = "english";
+
+// Battery voltage divider - tune R1/R2 to match your resistors
+const float R1 = 32000.0;
+const float R2 = 8000.0;
+const float referenceVoltage = 5.0;
+
+// DEFAULT ORIGINAL DATA
+// DIAGNOSES - ENGLISH 
+const char* default_diagnoses_en[] = {
+  "Good Sleep","Alcoholism","Angina","Stomachache","General Pain","Headaches",
+  "Infection","Acute pain","Back pain","Arthralgia","Toothache",
+  "No appetite","No taste","Motion sickness", "Hoarseness","Gastric Ulcer",
+  "Prostate ailments","Deafness","Flu","Hemorrhoids","Kidney stones",
+  "Cough","Runny nose","Hair loss","Hypertension","Low pressure",
+  "Thyroid Gland Disease","Bad breath","Herpes", "Epilepsy","Constipation",
+  "Dizziness","Accending 1","Accending 2", "H.Clark Zapper"
+};
+
+// DIAGNOSES - Cyrillic
+const char* default_diagnoses_ru[] = {
+  "Хороший сон","Алкоголизм","Стенокардия","Желудочная боль","Общая боль","Головная боль",
+  "Инфекция","Острая боль","Боль в спине","Артралгия","Зубная боль",
+  "Нет аппетита","Нет вкуса","Морская болезнь","Охриплость","Язва желудка",
+  "Недуги простаты","Глухота","Грипп","Геморой","Камни в почках",
+  "Кашель","Насморк","Потеря волос","Высокое давление","Низкое давление",
+  "Недуги Щитовидной","Запах изо рта","Герпес","Эпилепсия","Запоры",
+  "Головокружение","Вознесение 1","Вознесение 2","H.Clark Zapper"
+};
+
+// FREQUENCIES
+const int default_frequencies[][10] = {
+  {6,5,4,0,0,0,0,0,0,0},
+  {10000,0,0,0,0,0,0,0,0,0},
+  {787,776,727,0,0,0,0,0,0,0},
+  {0},{0},{0},{0},{0},{0},{0},
+  {10000,0,0,0,0,0,0,0,0,0},
+  {0},{0},{0},{0},{0},{0},{0},{0},{0},{0},
+  {787,776,727,690,465,428,660,0,0,0},
+  {10000,3000,95,0,0,0,0,0,0,0},
+  {10000,144,160,520,304,0,0,0,0,0},
+  {3000,95,880,1550,802,787,776,727,0,0},
+  {3000,95,10000,1550,802,880,787,727,690,666},
+  {787,784,776,728,727,465,432,0,0,0},
+  {160,500,1600,5000,324,528,0,0,0,0},
+  {5170,3000,2720,2489,1800,1600,1550,880,832,666},
+  {10000,465,444,1865,125,95,72,880,787,727},
+  {10000,20,0,0,0,0,0,0,0,0},
+  {10000,5000,648,624,600,465,440,648,444,1865},
+  {880,760,727,0,0,0,0,0,0,0},
+  {10000,1550,802,880,832,787,727,465,0,0},
+  {2050,880,1550,802,787,727,465,20,0,0},
+  {10000,1550,880,802,787,727,20,0,0,0},
+  {954,889,841,787,763,753,742,523,513,482},
+  {4474,6117,774,1550,447,880,802,727,0,0},
+  {10000,444,727,787,880,6000,3000,1552,0,0},
+  {7760,7344,3702,3672,1550,1500,1234,776,766,728},
+  {1800,1713,1550,802,800,880,787,727,444,20},
+  {10000,5000,2720,2170,1552,880,800,787,727,465},
+  {10000,3176,2112,95,324,528,880,787,727,304},
+  {727,787,880,0,0,0,0,0,0,0},
+  {16000,10000,160,80,35,0,0,0,0,0},
+  {1550,802,880,787,727,0,0,0,0,0},
+  {2950,1900,1577,1550,1489,1488,629,464,450,383},
+  {10000,880,802,787,727,700,650,600,210,125},
+  {3176,1550,880,832,802,787,776,727,444,422},
+  {1550,880,802,784,787,786,766,522,727,72},
+  {528,432,0,0,0,0,0,0,0,0},
+  {963,852,741,639,528,528,417,396,285,174},
+  {32000,1150,0,0,0,0,0,0,0,0}
+};
+
+//int numberOfDiagnoses = sizeof(diagnoses) / sizeof(diagnoses[0]);
+
+const int SCROLL_DOWN = 0;
+const int SCROLL_UP   = 1;
+const int ONE_BEEP    = 1;
+const int THREE_BEEPS = 3;
+
+const int PIEZO_BEEP_TONE   = 2000;
+const int PEIZO_BEEP_LENGTH = 1000;
+const int PEIZO_BEEP_PAUSE  =  500;
+
+const byte ITEMS_PER_PAGE = 8;
+
+// State variables
+byte selectedItem     = 1;
+byte prevSelectedItem = 1;
+byte pageOffset       = 0;
+char* titleLine       = (char*)"DIAGNOSES:";
+//char treatmentTime[3] = "20";
+char* strComplete     = (char*)"";
+
+bool isGeneratingFrequency = false;
+uint16_t intFreqToGenerate = 0;
+
+volatile bool encoderMoved    = false;
+volatile bool btnEnterPressed = false;
+volatile int  buttonOutput    = 0;
+
+enum {STATE_NORMAL, STATE_SHORT, STATE_LONG};
+long LONG_DELTA     = 1500UL;
+long DEBOUNCE_DELTA = 30UL;
+
+byte eepromAddress = 0;
+
+// Frame dimensions 320x240
+const int FRAME_X = 2;
+const int FRAME_Y = 2;
+const int FRAME_W = 316;
+const int FRAME_H = 236;
+
+// List area constants 
+const int LIST_Y_START   = 50;
+const int ITEM_HEIGHT    = 24;
+const int TEXT_Y_OFFSET  = 18;
+
+// title
+const int TITLE_BAR_HIGHT = 30;
+
+//  SETUP 
+void setup() {
+  Serial.begin(9600);
+  tft.begin();
+  tft.setRotation(1);
+
+  // Preload from SD card
+  if (!SD.begin(pinSDCard_CS)) {
+    Serial.println(F("SD Error!"));
+  }
+  char err[40];
+  if (!LoadFromSD(err)) {
+    ShowSDMessage(err);
+    LoadDefaults();
+  //  SD.begin(pinSDCard_CS);
+    SaveSettingsToSD();
+  }
+
+  while(1);
+
+  // ORIGINAL SETUP HERE 
+  tft.fillScreen(ILI9341_BLACK);
+  u8g2gfx.begin(tft);
+  u8g2gfx.setFontMode(1);
+  u8g2gfx.setFontDirection(0);
+  u8g2gfx.setForegroundColor(ILI9341_GREEN);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  pinMode(pinShutdown1, OUTPUT);
+  pinMode(pinShutdown2, OUTPUT);
+  digitalWrite(pinShutdown1, HIGH);
+  digitalWrite(pinShutdown2, LOW);
+  pinMode(pinEncoderCW,  INPUT_PULLUP);
+  pinMode(pinEncoderCCW, INPUT_PULLUP);
+  pinMode(pinBtnEnter,   INPUT_PULLUP);
+  //
+  gen.Begin();
+  gen.EnableOutput(false);
+  //
+  DisplayIntroScreen(); 
+  delay(2500);
+  //
+  DrawTitleBar();
+  DrawBattery();
+  DrawList();
+  //
+  attachInterrupt(digitalPinToInterrupt(pinEncoderCW),  OnScrollChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinEncoderCCW), OnScrollChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinBtnEnter),   OnButtonPress,  CHANGE);
+  byte saved = EEPROM.read(eepromAddress);
+  if (saved >= 1 && saved <= numberOfDiagnoses) {
+    SetSelectedItem(saved);
+  }
+
+}
+
+//  LOAD FROM SD 
+bool LoadFromSD(char* err) {
+  if (!SD.begin(pinSDCard_CS)) { strcpy(err,"SD init failed"); return false; }
+  if (!SD.exists(SETTINGS_FILE)) { strcpy(err,"No file found"); return false; }
+
+  File f = SD.open(SETTINGS_FILE);
+  if (!f) { strcpy(err,"File open error"); return false; }
+
+  bool inGeneral=false, inLang=false;
+  uint32_t storedCRC=0, calcCRC=0;
+  numberOfDiagnoses=0;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length() || line[0]=='#') continue;
+
+    if (line=="[general]"){ inGeneral=true; inLang=false; continue; }
+    if (line=="[english]"){ inLang=true; inGeneral=false; continue; }
+    if (line[0]=='['){ inLang=false; inGeneral=false; continue; }
+
+    if (inGeneral) {
+      if (line.startsWith("TreatmentTime="))
+        line.substring(14).toCharArray(treatmentTime,sizeof(treatmentTime));
+      if (line.startsWith("Checksum="))
+        storedCRC = line.substring(9).toInt();
+    }
+
+    if (inLang) {
+      int eq=line.indexOf('=');
+      if(eq<0) continue;
+      line.substring(0,eq).toCharArray(diagnoses[numberOfDiagnoses],MAX_NAME_LEN);
+      calcCRC ^= crc32_string(diagnoses[numberOfDiagnoses]);
+      String r=line.substring(eq+1);
+      for(int i=0;i<10;i++){ frequencies[numberOfDiagnoses][i]=0; }
+      int idx=0;
+      while(r.length() && idx<10){
+        int c=r.indexOf(',');
+        frequencies[numberOfDiagnoses][idx++]=r.substring(0,c).toInt();
+        if(c<0) break;
+        r=r.substring(c+1);
+      }
+      numberOfDiagnoses++;
+    }
+  }
+  f.close();
+
+  if (!numberOfDiagnoses){ strcpy(err,"Missing data set"); return false; }
+  if (storedCRC!=calcCRC){ strcpy(err,"Checksum mismatch"); return false; }
+  return true;
+}
+
+// ================= LOOP =================
+void loop() {
+  if (encoderMoved) {
+    int8_t dir = AnalyzeEncoderChange();
+    if (dir != 0) ScrollItem(dir > 0 ? SCROLL_UP : SCROLL_DOWN);
+  }
+
+  if (btnEnterPressed) {
+    switch (buttonOutput) {
+      case STATE_SHORT: ProcessButtonClick(); buttonOutput = STATE_NORMAL; break;
+      case STATE_LONG:  Shutdown();           buttonOutput = STATE_NORMAL; break;
+    }
+    btnEnterPressed = false;
+  }
+}
+
+// ================= CRC32 =================
+uint32_t crc32_update(uint32_t crc, uint8_t data) {
+  crc ^= data;
+  for (int i = 0; i < 8; i++)
+    crc = crc & 1 ? (crc >> 1) ^ 0xEDB88320UL : crc >> 1;
+  return crc;
+}
+
+uint32_t crc32_string(const char* s) {
+  uint32_t crc = 0xFFFFFFFF;
+  while (*s) crc = crc32_update(crc, *s++);
+  return ~crc;
+}
+
+// ================= ERROR DISPLAY =================
+void ShowSDMessage(const char* msg) {
+  tft.fillScreen(ILI9341_RED);
+  u8g2gfx.setFont(u8g2_font_helvB18_te);
+  u8g2gfx.setForegroundColor(ILI9341_WHITE);
+  u8g2gfx.setCursor(20, 120);
+  u8g2gfx.print(msg);
+  delay(5000);
+}
+
+//  LOAD DEFAULTS
+void LoadDefaults() {
+  numberOfDiagnoses = sizeof(default_diagnoses_en) / sizeof(default_diagnoses_en[0]);
+  for (int i = 0; i < numberOfDiagnoses; i++) {
+    strncpy(diagnoses[i], default_diagnoses_en[i], MAX_NAME_LEN);
+    for (int j = 0; j < 10; j++)
+      frequencies[i][j] = default_frequencies[i][j];
+  }
+  strcpy(treatmentTime, "20");
+  strcpy(language, "english");
+}
+
+//  SAVE SD 
+void SaveSettingsToSD() {
+  File f = SD.open(SETTINGS_FILE, FILE_WRITE);
+  if (!f) return;
+
+  uint32_t crc = 0;
+  for (int i = 0; i < numberOfDiagnoses; i++)
+    crc ^= crc32_string(diagnoses[i]);
+
+  f.println("[general]");
+  f.print("Language="); f.println(language);
+  f.print("TreatmentTime="); f.println(treatmentTime);
+  f.print("Checksum="); f.println(crc);
+  f.println();
+
+  f.println("[english]");
+  for (int i = 0; i < numberOfDiagnoses; i++) {
+    f.print(diagnoses[i]);
+    f.print("=");
+    for (int j = 0; j < 10 && frequencies[i][j]; j++) {
+      if (j) f.print(",");
+      f.print(frequencies[i][j]);
+    }
+    f.println();
+  }
+  f.close();
+}
+
+///  OPTIMIZED SCROLL HANDLING 
+void ScrollItem(bool direction) {
+  prevSelectedItem = selectedItem;
+  if (direction == SCROLL_UP) {
+    selectedItem++;
+    if (selectedItem > numberOfDiagnoses) selectedItem = 1;
+  } else {
+    selectedItem--;
+    if (selectedItem < 1) selectedItem = numberOfDiagnoses;
+  }
+  byte newPageOffset = CalulatePageOffset(selectedItem);
+  if (newPageOffset != pageOffset) {
+    pageOffset = newPageOffset;
+    DrawList();
+  } else {
+    RedrawSelectionOnly();
+  }
+}
+
+void DrawList() {
+  tft.fillRect(0, TITLE_BAR_HIGHT, 320, 240 - TITLE_BAR_HIGHT, ILI9341_BLACK); 
+  u8g2gfx.setFont(u8g2_font_10x20_tf);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  int currentPosY = LIST_Y_START;
+  for (byte currentItem = 0; currentItem < ITEMS_PER_PAGE; currentItem++) {
+    int diagnoseIndex = pageOffset + currentItem;
+    if (diagnoseIndex >= numberOfDiagnoses) break;
+    bool isSelected = (diagnoseIndex == (selectedItem - 1));
+    if (isSelected) {
+      tft.fillRect(8, currentPosY - 19, 304, 24, ILI9341_NAVY);
+      u8g2gfx.setForegroundColor(ILI9341_YELLOW);
+    } else {
+      u8g2gfx.setForegroundColor(ILI9341_GREEN);
+    }
+    u8g2gfx.setCursor(18, currentPosY);
+    u8g2gfx.print(diagnoses[diagnoseIndex]);
+    currentPosY += ITEM_HEIGHT;
+  }
+}
+
+void RedrawSelectionOnly() {
+  u8g2gfx.setFont(u8g2_font_10x20_tf);
+  byte prevLocalIdx = prevSelectedItem - 1 - pageOffset;
+  int prevY = LIST_Y_START + prevLocalIdx * ITEM_HEIGHT;
+  tft.fillRect(8, prevY - 19, 304, 24, ILI9341_BLACK);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  u8g2gfx.setForegroundColor(ILI9341_GREEN);
+  u8g2gfx.setCursor(18, prevY);
+  u8g2gfx.print(diagnoses[prevSelectedItem - 1]);
+
+  byte newLocalIdx = selectedItem - 1 - pageOffset;
+  int newY = LIST_Y_START + newLocalIdx * ITEM_HEIGHT;
+  tft.fillRect(8, newY - 19, 304, 24, ILI9341_NAVY);
+  u8g2gfx.setForegroundColor(ILI9341_YELLOW);
+  u8g2gfx.setCursor(18, newY);
+  u8g2gfx.print(diagnoses[selectedItem - 1]);
+}
+
+//  DISPLAY FUNCTIONS 
+void DisplayIntroScreen(void) {
+  tft.fillScreen(ILI9341_BLUE);
+  DrawIntroFrame();
+  u8g2gfx.setFont(u8g2_font_helvB24_te);
+  u8g2gfx.setForegroundColor(GOLD2);
+  int textWidth = u8g2gfx.getUTF8Width("Dr. Royal Rife");
+  u8g2gfx.setCursor((320 - textWidth) / 2, 80);
+  u8g2gfx.print("Dr. Royal Rife");
+  textWidth = u8g2gfx.getUTF8Width("Healing Machine");
+  u8g2gfx.setCursor((320 - textWidth) / 2, 120);
+  u8g2gfx.print("Healing Machine");
+  DrawGoldenCrown(160, 135);
+  u8g2gfx.setFont(u8g2_font_7x14_tr);
+  u8g2gfx.setForegroundColor(ILI9341_MAGENTA);
+  textWidth = u8g2gfx.getUTF8Width("by kd2cmo 2026");
+  u8g2gfx.setCursor((320 - textWidth) / 2, 190);
+  u8g2gfx.print("by kd2cmo 2026");
+  textWidth = u8g2gfx.getUTF8Width("Wait...");
+  u8g2gfx.setCursor((320 - textWidth) / 2, 210);
+  u8g2gfx.print("Wait...");
+}
+
+void DrawTitleBar() {
+  tft.fillRect(0, 0, 320, TITLE_BAR_HIGHT, ILI9341_BLUE);
+  u8g2gfx.setFont(u8g2_font_t0_22b_tf);
+  u8g2gfx.setBackgroundColor(ILI9341_BLUE);
+  u8g2gfx.setForegroundColor(ILI9341_YELLOW);
+  int titleWidth = u8g2gfx.getUTF8Width(titleLine);
+  u8g2gfx.setCursor((320 - titleWidth) / 2, 24);
+  u8g2gfx.print(titleLine);
+}
+
+void DrawBattery() {
+  float v = MeasureBatteryVoltage();
+  String s = String(v, 1) + "v";
+  u8g2gfx.setFont(u8g2_font_9x18B_tf);
+  u8g2gfx.setBackgroundColor(ILI9341_BLUE);
+  u8g2gfx.setForegroundColor(ILI9341_YELLOW);
+  int w = u8g2gfx.getUTF8Width(s.c_str());
+  u8g2gfx.setCursor(320 - w - 8, 23);
+  u8g2gfx.print(s.c_str());
+}
+
+byte CalulatePageOffset(byte item) {
+  return ((item - 1) / ITEMS_PER_PAGE) * ITEMS_PER_PAGE;
+}
+
+void SetSelectedItem(byte item) {
+  selectedItem = item;
+  pageOffset = CalulatePageOffset(item);
+  prevSelectedItem = item;
+  DrawList();
+}
+
+void DisplayTreatInProgressScreen(String frequency, String seq) {
+  tft.fillScreen(ILI9341_BLACK);
+  DrawTitleBar();
+  DrawBattery();
+  u8g2gfx.setFont(u8g2_font_fub20_tr);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  u8g2gfx.setForegroundColor(ILI9341_WHITE);
+  u8g2gfx.setCursor(55, 70);
+  u8g2gfx.print("Remaining Time:");
+  if (strlen(strComplete) == 0 && frequency.length() > 0) {
+    String line = "Sequence: " + seq + "   Frequency: " + frequency + " Hz";
+    u8g2gfx.setFont(u8g2_font_helvB14_te);
+    u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+    u8g2gfx.setForegroundColor(ILI9341_GREEN);
+    int textWidth = u8g2gfx.getUTF8Width(line.c_str());
+    u8g2gfx.setCursor((320 - textWidth) / 2, 210);
+    u8g2gfx.print(line.c_str());
+  }
+  if (strlen(strComplete) > 0) {
+    u8g2gfx.setFont(u8g2_font_helvB24_te);
+    u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+    u8g2gfx.setForegroundColor(ILI9341_RED);
+    int textWidth = u8g2gfx.getUTF8Width(strComplete);
+    u8g2gfx.setCursor((320 - textWidth) / 2, 190);
+    u8g2gfx.print(strComplete);
+  }
+  // Note: Initial countdown now handled outside, with correct elapsed and forceFull=true
+}
+
+// OPTIMIZED COUNTDOWN 
+void UpdateCountdown(unsigned long elapsedMs, bool forceFull = false) {
+  static unsigned long lastUpdate = 0;
+  unsigned long totalMs = atoi(treatmentTime) * 60000UL;
+  unsigned long remainingMs = (elapsedMs >= totalMs) ? 0 : totalMs - elapsedMs;
+  int minLeft = remainingMs / 60000UL;
+  int secLeft = (remainingMs % 60000UL) / 1000;
+  char buf[6];
+  //
+  sprintf(buf, "%02d:%02d", minLeft, secLeft);
+  // Prepare large font once per call
+  u8g2gfx.setFont(u8g2_font_fub42_tf);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  u8g2gfx.setForegroundColor(ILI9341_MAGENTA);
+  // === ONE-TIME CALCULATION OF FIXED SLOT POSITIONS (digit slots use max width)
+  static bool positionsCalculated = false;
+  static int  charX[5];
+  static int  charW[5];
+  if (!positionsCalculated) {
+    positionsCalculated = true;
+    // Find widest digit (handles any proportional font safely)
+    int maxDigitW = 0;
+    for (char c = '0'; c <= '9'; c++) {
+      char tmp[2] = {c, 0};
+      int w = u8g2gfx.getUTF8Width(tmp);
+      if (w > maxDigitW) maxDigitW = w;
+    }
+    int colonW = u8g2gfx.getUTF8Width(":");
+    // Total width of the whole "MM:SS" (4 digit slots + colon slot)
+    int totalW = maxDigitW * 4 + colonW;
+    int startX = 160 - totalW / 2;   // center at x=160 (same logic as original)
+    // Build fixed slots (left-to-right)
+    int cx = startX;
+    charX[0] = cx; charW[0] = maxDigitW; cx += maxDigitW;  // tens of minutes
+    charX[1] = cx; charW[1] = maxDigitW; cx += maxDigitW;  // units of minutes
+    charX[2] = cx; charW[2] = colonW;    cx += colonW;     // colon
+    charX[3] = cx; charW[3] = maxDigitW; cx += maxDigitW;  // tens of seconds
+    charX[4] = cx; charW[4] = maxDigitW;                   // units of seconds
+  }
+  // PARTIAL UPDATE: only redraw digits that actually changed (unless forceFull)
+  static char prevBuf[6] = "99:99";  // Initial dummy value
+  //
+  for (int i = 0; i < 5; i++) {
+    if (forceFull || buf[i] != prevBuf[i]) {
+      // 1. Clear only this character slot (no full-area black flash)
+      tft.fillRect(charX[i], 96, charW[i], 45, ILI9341_BLACK);
+      // 2. Center the new character inside its slot (handles different widths)
+      char tmp[2] = {buf[i], 0};
+      int actualW = u8g2gfx.getUTF8Width(tmp);
+      int offset = (charW[i] - actualW) / 2;
+      u8g2gfx.setCursor(charX[i] + offset, 140);
+      u8g2gfx.print(tmp);
+    }
+  }
+  // Remember for next call
+  strcpy(prevBuf, buf);
+  lastUpdate = millis();
+}
+
+//
+bool GenerateFrequency() {
+  int numFreq = 0;
+  for (int i = 0; i < 10; i++) {
+    if (frequencies[10 * (selectedItem - 1) + i] > 0) numFreq++;
+  }
+  if (numFreq == 0) return false;
+
+  unsigned long fragmentMs = (atoi(treatmentTime) * 60000UL) / numFreq;
+  unsigned long sessionStart = millis();
+
+  gen.EnableOutput(true);
+  strComplete = (char*)"";
+  unsigned long lastSecond = 0;
+
+  for (int i = 0; i < numFreq; i++) {
+    unsigned long freqStart = millis();
+    intFreqToGenerate = frequencies[10 * (selectedItem - 1) + i];
+    String freqStr = String(intFreqToGenerate);
+    String seqStr  = String(i + 1);
+
+    DisplayTreatInProgressScreen(freqStr, seqStr);
+    // Immediately draw initial countdown with forceFull=true (since screen just cleared)
+    UpdateCountdown(millis() - sessionStart, true);
+
+    gen.ApplySignal(SQUARE_WAVE, REG0, intFreqToGenerate);
+
+    while ((millis() - freqStart) < fragmentMs && isGeneratingFrequency) {
+      if (btnEnterPressed) {
+        gen.EnableOutput(false);
+        return true;
+      }
+      unsigned long now = millis();
+      if (now - lastSecond >= 1000) {
+        unsigned long elapsed = now - sessionStart;
+        UpdateCountdown(elapsed);  // Normal partial update
+        lastSecond = now;
+      }
+    }
+    PlayTone(ONE_BEEP);
+  }
+
+  gen.EnableOutput(false);
+  isGeneratingFrequency = false;
+  strComplete = (char*)"Finished!";
+  PlayTone(THREE_BEEPS);
+
+  DisplayTreatInProgressScreen("", "");
+  UpdateCountdown(atoi(treatmentTime) * 60000UL, true);  // Final 00:00 with forceFull
+  delay(3000);
+
+  titleLine = (char*)"DIAGNOSES:";
+  DrawTitleBar();
+  DrawBattery();
+  DrawList();
+
+  strComplete = (char*)"";
+  digitalWrite(pinShutdown1, LOW);
+  digitalWrite(pinShutdown2, HIGH);
+
+  return false;
+}
+
+void ProcessButtonClick() {
+  if (!isGeneratingFrequency) {
+    EEPROM.update(eepromAddress, selectedItem);
+    titleLine = (char*)diagnoses[selectedItem - 1];
+    isGeneratingFrequency = true;
+    btnEnterPressed = false;
+    bool aborted = GenerateFrequency();
+    if (aborted) {
+      isGeneratingFrequency = false;
+      btnEnterPressed = false;
+      SetSelectedItem(selectedItem);
+      titleLine = (char*)"DIAGNOSES:";
+      DrawTitleBar();
+      DrawBattery();
+    }
+  } else {
+    btnEnterPressed = true;
+  }
+}
+
+void Shutdown() {
+  digitalWrite(pinShutdown1, LOW);
+  digitalWrite(pinShutdown2, HIGH);
+  isGeneratingFrequency = false;
+  btnEnterPressed = false;
+  debugln("Shutdown initiated");
+}
+
+//  ENCODER / BUTTON 
+void OnScrollChange() {
+  encoderMoved = true;
+}
+
+int8_t AnalyzeEncoderChange() {
+  encoderMoved = false;
+  static uint8_t prev_AB = 0b00000011;
+  static int8_t  encoderVal = 0;
+  uint8_t A = digitalRead(pinEncoderCW);
+  uint8_t B = digitalRead(pinEncoderCCW);
+  uint8_t current_AB = (A << 1) | B;
+  uint8_t transition = (prev_AB << 2) | current_AB;
+  static const int8_t deltaTable[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
+  int8_t delta = deltaTable[transition];
+  encoderVal += delta;
+  int8_t result = 0;
+  if (encoderVal <= -4) { result = -1; encoderVal = 0; }
+  if (encoderVal >=  4) { result =  1; encoderVal = 0; }
+  if (encoderVal <= -2) { result = -1; encoderVal += 2; }
+  if (encoderVal >=  2) { result =  1; encoderVal -= 2; }
+  prev_AB = current_AB;
+  if (result != 0) {
+    debug("Step: "); debug(result);
+    debug("  AB: "); debug(current_AB);
+    debug("  encVal: "); debugln(encoderVal);
+  }
+  return result;
+}
+
+void OnButtonPress() {
+  int buttonState;
+  static int lastButtonStatus = HIGH;
+  static unsigned long longTime = 0ul;
+  static unsigned long shortTime = 0ul;
+
+  buttonState = digitalRead(pinBtnEnter);
+  boolean timeoutShort = (millis() > shortTime);
+  boolean timeoutLong  = (millis() > longTime);
+
+  if (buttonState != lastButtonStatus) {
+      shortTime = millis() + DEBOUNCE_DELTA;
+      longTime  = millis() + LONG_DELTA;
+  }
+
+  boolean buttonStateChange = (buttonState != lastButtonStatus);
+  boolean buttonReleased = (buttonStateChange && (buttonState == HIGH));
+  lastButtonStatus = buttonState;
+
+  if (!buttonStateChange) {
+       buttonOutput = STATE_NORMAL | buttonOutput;
+       return;
+  }
+
+  if (timeoutLong && buttonReleased) {
+      buttonOutput = STATE_LONG | buttonOutput;
+      btnEnterPressed = true;
+  } else if (timeoutShort && buttonReleased) {
+      buttonOutput = STATE_SHORT | buttonOutput;
+      btnEnterPressed = true;
+  } else {
+      buttonOutput = STATE_NORMAL | buttonOutput;
+      btnEnterPressed = false;
+  }
+}
+
+void DrawIntroFrame() {
+  tft.fillRoundRect(FRAME_X, FRAME_Y, FRAME_W, FRAME_H, 24, GOLD1);
+  tft.drawRoundRect(FRAME_X+5, FRAME_Y+5, FRAME_W-10, FRAME_H-10, 18, GOLD3);
+  tft.drawRoundRect(FRAME_X+12, FRAME_Y+12, FRAME_W-24, FRAME_H-24, 12, GOLD4);
+  for (int i = 0; i < 20; i++) {
+    tft.drawPixel(FRAME_X+12+i, FRAME_Y+12+sin(i*0.4)*8, GOLD2);
+    tft.drawPixel(FRAME_X+FRAME_W-12-i, FRAME_Y+12+sin(i*0.4)*8, GOLD2);
+    tft.drawPixel(FRAME_X+12+i, FRAME_Y+FRAME_H-12-sin(i*0.4)*8, GOLD2);
+    tft.drawPixel(FRAME_X+FRAME_W-12-i, FRAME_Y+FRAME_H-12-sin(i*0.4)*8, GOLD2);
+  }
+  tft.fillRoundRect(FRAME_X+20, FRAME_Y+20, FRAME_W-40, FRAME_H-40, 8, ILI9341_BLACK);
+}
+
+void DrawGoldenCrown(int cx, int topY) {
+  const int w = 52;
+  const int h = 28;
+  const int baseH = 8;
+  int x0 = cx - w / 2;
+  int y0 = topY;
+  tft.fillRoundRect(x0, y0 + h - baseH, w, baseH, baseH / 3, GOLD3);
+  tft.drawRoundRect(x0, y0 + h - baseH, w, baseH, baseH / 3, GOLD1);
+  tft.drawFastHLine(x0 + 3, y0 + h - baseH, w - 6, GOLD4);
+  tft.drawFastHLine(x0 + 2, y0 + h - 1, w - 4, GOLD2);
+  for (int i = 0; i < 5; i++) {
+    int gemX = x0 + w * (i + 1) / 6;
+    int gemY = y0 + h - baseH / 2;
+    tft.fillCircle(gemX, gemY, baseH / 3, GOLD1);
+    tft.drawCircle(gemX, gemY, baseH / 3, GOLD4);
+  }
+  int peakBaseY = y0 + h - baseH;
+  int leftX   = x0 + w / 4;
+  int centerX = cx;
+  int rightX  = x0 + 3 * w / 4;
+  int leftH   = 12;
+  int centerH = 16;
+  int rightH  = 12;
+  tft.fillTriangle(leftX, peakBaseY, leftX - 6, peakBaseY - leftH, leftX + 6, peakBaseY - leftH, GOLD2);
+  tft.fillCircle(leftX, peakBaseY - leftH - 2, 3, GOLD4);
+  tft.drawCircle(leftX, peakBaseY - leftH - 2, 3, GOLD1);
+  tft.fillTriangle(rightX, peakBaseY, rightX - 6, peakBaseY - rightH, rightX + 6, peakBaseY - rightH, GOLD2);
+  tft.fillCircle(rightX, peakBaseY - rightH - 2, 3, GOLD4);
+  tft.drawCircle(rightX, peakBaseY - rightH - 2, 3, GOLD1);
+  tft.fillTriangle(centerX, peakBaseY, centerX - 8, peakBaseY - centerH, centerX + 8, peakBaseY - centerH, GOLD1);
+  int crossX = centerX;
+  int crossY = peakBaseY - centerH - 3;
+  tft.drawLine(crossX, crossY - 3, crossX, crossY + 3, GOLD4);
+  tft.drawLine(crossX - 3, crossY, crossX + 3, crossY, GOLD4);
+  tft.fillCircle(crossX, crossY, 2, GOLD3);
+  for (int i = 0; i <= 12; i++) {
+    float t = i / 12.0;
+    int x = leftX + t * (centerX - leftX);
+    int y = peakBaseY - leftH * (1 - t) - centerH * t + 4 * sin(t * PI);
+    tft.drawPixel(x, y, GOLD2);
+  }
+  for (int i = 0; i <= 12; i++) {
+    float t = i / 12.0;
+    int x = centerX + t * (rightX - centerX);
+    int y = peakBaseY - centerH * (1 - t) - rightH * t + 4 * sin(t * PI);
+    tft.drawPixel(x, y, GOLD2);
+  }
+  tft.drawPixel(leftX - 3, peakBaseY - leftH / 2, GOLD4);
+  tft.drawPixel(rightX + 3, peakBaseY - rightH / 2, GOLD4);
+  tft.drawPixel(centerX, peakBaseY - centerH + 2, GOLD4);
+}
+
+float MeasureBatteryVoltage() {
+  int raw = analogRead(pinBatteryLevel);
+  float voltage = (raw * referenceVoltage) / 1024.0;
+  return voltage / (R2 / (R1 + R2));
+}
+
+void PlayTone(int n) {
+  for (int i = 0; i < n; i++) {
+    tone(pinBeepOut, PIEZO_BEEP_TONE, PEIZO_BEEP_LENGTH);
+    delay(PEIZO_BEEP_LENGTH);
+    noTone(pinBeepOut);
+    delay(PEIZO_BEEP_PAUSE);
+  }
+}
+
+
+/*
+// Uses Adafruit_ILI9341 + U8g2_for_Adafruit_GFX for Cyrillic
+// Arduino Mega2560 + 2.8" 320x240 TFT (ILI9341)
+// Optimized partial redraw for fast scrolling
+// UPDATED: UpdateCountdown now uses per-digit partial redraws
+//          → only the digits that actually change are cleared + redrawn.
+//          This eliminates the full-area black flash every second → no more visible flicker.
+// FURTHER UPDATED: To fix colon not displaying after first sequence:
+//          - Added forceFull parameter to UpdateCountdown to force redraw of all characters when screen is refreshed.
+//          - Moved initial UpdateCountdown call out of DisplayTreatInProgressScreen and into GenerateFrequency after each screen refresh.
+//          - Now passes current elapsedMs for accurate initial remaining time (fixes bug where it always showed full time briefly).
+//          - Removed static firstDraw as forceFull handles it.
+
+#include <EEPROM.h>
+#include <AD9833.h>    // https://github.com/Billwilliams1952/AD9833-Library-Arduino
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <U8g2_for_Adafruit_GFX.h>
+
+#define DEBUG 0
+#if DEBUG == 1
+  #define debug(x) Serial.print(x)
+  #define debugln(x) Serial.println(x)
+#else
+  #define debug(x)
+  #define debugln(x)
+#endif
+
+// ILI9341 Pins (Hardware SPI on Mega: SCK=52, MOSI=51)
+#define TFT_CS   53
+#define TFT_DC   48
+#define TFT_RST  49
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+U8G2_FOR_ADAFRUIT_GFX u8g2gfx;
+
+// Gold color palette
+#define GOLD1  tft.color565(255, 215, 0)
+#define GOLD2  tft.color565(218, 165, 32)
+#define GOLD3  tft.color565(184, 134, 11)
+#define GOLD4  tft.color565(255, 236, 139)
+
+// AD9833
+#define pinGenCS         9
+AD9833 gen(pinGenCS);
+
+// Pins
+#define pinEncoderCW     2
+#define pinEncoderCCW    3
+#define pinBeepOut       4
+#define pinShutdown2     5
+#define pinShutdown1     6
+#define pinBtnEnter     21
+#define pinBatteryLevel A0
+
+// Battery voltage divider - tune R1/R2 to match your resistors
+const float R1 = 32000.0;
+const float R2 = 8000.0;
+const float referenceVoltage = 5.0;
+
+// Diagnoses - English version (uncomment Cyrillic block below if preferred)
+const char* diagnoses[] = {
+  "Good Sleep","Alcoholism","Angina","Stomachache","General Pain","Headaches",
+  "Infection","Acute pain","Back pain","Arthralgia","Toothache",
+  "No appetite","No taste","Motion sickness", "Hoarseness","Gastric Ulcer",
+  "Prostate ailments","Deafness","Flu","Hemorrhoids","Kidney stones",
+  "Cough","Runny nose","Hair loss","Hypertension","Low pressure",
+  "Thyroid Gland Disease","Bad breath","Herpes", "Epilepsy","Constipation",
+  "Dizziness","Accending 1","Accending 2", "H.Clark Zapper"
+};
+
+// Cyrillic version
+char* default_diagnoses_ru[] = {
+  "Хороший сон","Алкоголизм","Стенокардия","Желудочная боль","Общая боль","Головная боль",
+  "Инфекция","Острая боль","Боль в спине","Артралгия","Зубная боль",
+  "Нет аппетита","Нет вкуса","Морская болезнь","Охриплость","Язва желудка",
+  "Недуги простаты","Глухота","Грипп","Геморой","Камни в почках",
+  "Кашель","Насморк","Потеря волос","Высокое давление","Низкое давление",
+  "Недуги Щитовидной","Запах изо рта","Герпес","Эпилепсия","Запоры",
+  "Головокружение","Вознесение 1","Вознесение 2","H.Clark Zapper"
+};  
+
+const int frequencies[] = {
+  6,5,4,0,0,0,0,0,0,0,
+  10000,0,0,0,0,0,0,0,0,0,
+  787,776,727,690,465,428,660,0,0,0,
+  10000,3000,95,0,0,0,0,0,0,0,
+  3000,2720,95,666,80,40,0,0,0,0,
+  10000,144,160,520,304,0,0,0,0,0,
+  3000,95,880,1550,802,787,776,727,0,0,
+  3000,95,10000,1550,802,880,787,727,690,666,
+  787,784,776,728,727,465,432,0,0,0,
+  160,500,1600,5000,324,528,0,0,0,0,
+  5170,3000,2720,2489,1800,1600,1550,880,832,666,
+  10000,465,444,1865,125,95,72,880,787,727,
+  10000,20,0,0,0,0,0,0,0,0,
+  10000,5000,648,624,600,465,440,648,444,1865,
+  880,760,727,0,0,0,0,0,0,0,
+  10000,1550,802,880,832,787,727,465,0,0,
+  2050,880,1550,802,787,727,465,20,0,0,
+  10000,1550,880,802,787,727,20,0,0,0,
+  954,889,841,787,763,753,742,523,513,482,
+  4474,6117,774,1550,447,880,802,727,0,0,
+  10000,444,727,787,880,6000,3000,1552,0,0,
+  7760,7344,3702,3672,1550,1500,1234,776,766,728,
+  1800,1713,1550,802,800,880,787,727,444,20,
+  10000,5000,2720,2170,1552,880,800,787,727,465,
+  10000,3176,2112,95,324,528,880,787,727,304,
+  727,787,880,0,0,0,0,0,0,0,
+  16000,10000,160,80,35,0,0,0,0,0,
+  1550,802,880,787,727,0,0,0,0,0,
+  2950,1900,1577,1550,1489,1488,629,464,450,383,
+  10000,880,802,787,727,700,650,600,210,125,
+  3176,1550,880,832,802,787,776,727,444,422,
+  1550,880,802,784,787,786,766,522,727,72,
+  528,432,0,0,0,0,0,0,0,0,
+  963,852,741,639,528,528,417,396,285,174,
+  32000,1150,0,0,0,0,0,0,0,0
+};
+
+int numberOfDiagnoses = sizeof(diagnoses) / sizeof(diagnoses[0]);
+
+const int SCROLL_DOWN = 0;
+const int SCROLL_UP   = 1;
+const int ONE_BEEP    = 1;
+const int THREE_BEEPS = 3;
+
+const int PIEZO_BEEP_TONE   = 2000;
+const int PEIZO_BEEP_LENGTH = 1000;
+const int PEIZO_BEEP_PAUSE  =  500;
+
+const byte ITEMS_PER_PAGE = 8;
+
+// State variables
+byte selectedItem     = 1;
+byte prevSelectedItem = 1;
+byte pageOffset       = 0;
+char* titleLine       = (char*)"DIAGNOSES:";
+char treatmentTime[3] = "20";
+char* strComplete     = (char*)"";
+
+bool isGeneratingFrequency = false;
+uint16_t intFreqToGenerate = 0;
+
+volatile bool encoderMoved    = false;
+volatile bool btnEnterPressed = false;
+volatile int  buttonOutput    = 0;
+
+enum {STATE_NORMAL, STATE_SHORT, STATE_LONG};
+long LONG_DELTA     = 1500UL;
+long DEBOUNCE_DELTA = 30UL;
+
+byte eepromAddress = 0;
+
+// Frame dimensions for color horiz 320x240
+const int FRAME_X = 2;
+const int FRAME_Y = 2;
+const int FRAME_W = 316;
+const int FRAME_H = 236;
+
+// List area constants (avoid touching top bar)
+const int LIST_Y_START   = 50;
+const int ITEM_HEIGHT    = 24;
+const int TEXT_Y_OFFSET  = 18;
+
+// title
+const int TITLE_BAR_HIGHT = 30;
+
+// Progress Circle
+const int CIRCLE_CENTER_X = 255;
+const int CIRCLE_CENTER_Y = 125;
+const int OUTER_RADIUS    = 58;
+const int INNER_RADIUS    = 38;
+const int RING_THICKNESS  = 20;
+const int TOTAL_MINUTES   = 20;
+
+
+// ======= SETUP ====================
+void setup() {
+  Serial.begin(9600);
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+  u8g2gfx.begin(tft);
+  u8g2gfx.setFontMode(1);
+  u8g2gfx.setFontDirection(0);
+  u8g2gfx.setForegroundColor(ILI9341_GREEN);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  pinMode(pinShutdown1, OUTPUT);
+  pinMode(pinShutdown2, OUTPUT);
+  digitalWrite(pinShutdown1, HIGH);
+  digitalWrite(pinShutdown2, LOW);
+  pinMode(pinEncoderCW,  INPUT_PULLUP);
+  pinMode(pinEncoderCCW, INPUT_PULLUP);
+  pinMode(pinBtnEnter,   INPUT_PULLUP);
+  gen.Begin();
+  gen.EnableOutput(false);
+  DisplayIntroScreen(); 
+  delay(2500);
+  DrawTitleBar();
+  DrawBattery();
+  DrawList();
+  attachInterrupt(digitalPinToInterrupt(pinEncoderCW),  OnScrollChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinEncoderCCW), OnScrollChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinBtnEnter),   OnButtonPress,  CHANGE);
+  byte saved = EEPROM.read(eepromAddress);
+  if (saved >= 1 && saved <= numberOfDiagnoses) {
+    SetSelectedItem(saved);
+  }
+}
+
+// ======= LOOP ====================
+void loop() {
+  if (encoderMoved) {
+    int8_t dir = AnalyzeEncoderChange();
+    if (dir != 0) ScrollItem(dir > 0 ? SCROLL_UP : SCROLL_DOWN);
+  }
+
+  if (btnEnterPressed) {
+    switch (buttonOutput) {
+      case STATE_SHORT: ProcessButtonClick(); buttonOutput = STATE_NORMAL; break;
+      case STATE_LONG:  Shutdown();           buttonOutput = STATE_NORMAL; break;
+    }
+    btnEnterPressed = false;
+  }
+}
+
+// ======= OPTIMIZED SCROLL HANDLING =======
+void ScrollItem(bool direction) {
+  prevSelectedItem = selectedItem;
+  if (direction == SCROLL_UP) {
+    selectedItem++;
+    if (selectedItem > numberOfDiagnoses) selectedItem = 1;
+  } else {
+    selectedItem--;
+    if (selectedItem < 1) selectedItem = numberOfDiagnoses;
+  }
+  byte newPageOffset = CalulatePageOffset(selectedItem);
+  if (newPageOffset != pageOffset) {
+    pageOffset = newPageOffset;
+    DrawList();
+  } else {
+    RedrawSelectionOnly();
+  }
+}
+
+void DrawList() {
+  tft.fillRect(0, TITLE_BAR_HIGHT, 320, 240 - TITLE_BAR_HIGHT, ILI9341_BLACK); 
+  u8g2gfx.setFont(u8g2_font_10x20_t_cyrillic); //u8g2_font_10x20_tf
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  int currentPosY = LIST_Y_START;
+  for (byte currentItem = 0; currentItem < ITEMS_PER_PAGE; currentItem++) {
+    int diagnoseIndex = pageOffset + currentItem;
+    if (diagnoseIndex >= numberOfDiagnoses) break;
+    bool isSelected = (diagnoseIndex == (selectedItem - 1));
+    if (isSelected) {
+      tft.fillRect(8, currentPosY - 19, 304, 24, ILI9341_NAVY);
+      u8g2gfx.setForegroundColor(ILI9341_YELLOW);
+    } else {
+      u8g2gfx.setForegroundColor(ILI9341_GREEN);
+    }
+    u8g2gfx.setCursor(18, currentPosY);
+    u8g2gfx.print(diagnoses[diagnoseIndex]);
+    currentPosY += ITEM_HEIGHT;
+  }
+}
+
+void RedrawSelectionOnly() {
+  u8g2gfx.setFont(u8g2_font_10x20_tf);
+  byte prevLocalIdx = prevSelectedItem - 1 - pageOffset;
+  int prevY = LIST_Y_START + prevLocalIdx * ITEM_HEIGHT;
+  tft.fillRect(8, prevY - 19, 304, 24, ILI9341_BLACK);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  u8g2gfx.setForegroundColor(ILI9341_GREEN);
+  u8g2gfx.setCursor(18, prevY);
+  u8g2gfx.print(diagnoses[prevSelectedItem - 1]);
+
+  byte newLocalIdx = selectedItem - 1 - pageOffset;
+  int newY = LIST_Y_START + newLocalIdx * ITEM_HEIGHT;
+  tft.fillRect(8, newY - 19, 304, 24, ILI9341_NAVY);
+  u8g2gfx.setForegroundColor(ILI9341_YELLOW);
+  u8g2gfx.setCursor(18, newY);
+  u8g2gfx.print(diagnoses[selectedItem - 1]);
+}
+
+// ======= DISPLAY FUNCTIONS =======
+void DisplayIntroScreen(void) {
+  tft.fillScreen(ILI9341_BLUE);
+  DrawIntroFrame();
+  u8g2gfx.setFont(u8g2_font_helvB24_te);
+  u8g2gfx.setForegroundColor(GOLD2);
+  int textWidth = u8g2gfx.getUTF8Width("Dr. Royal Rife");
+  u8g2gfx.setCursor((320 - textWidth) / 2, 80);
+  u8g2gfx.print("Dr. Royal Rife");
+  textWidth = u8g2gfx.getUTF8Width("Healing Machine");
+  u8g2gfx.setCursor((320 - textWidth) / 2, 120);
+  u8g2gfx.print("Healing Machine");
+  DrawGoldenCrown(160, 135);
+  u8g2gfx.setFont(u8g2_font_7x14_tr);
+  u8g2gfx.setForegroundColor(ILI9341_MAGENTA);
+  textWidth = u8g2gfx.getUTF8Width("by kd2cmo 2026");
+  u8g2gfx.setCursor((320 - textWidth) / 2, 190);
+  u8g2gfx.print("by kd2cmo 2026");
+  textWidth = u8g2gfx.getUTF8Width("Wait...");
+  u8g2gfx.setCursor((320 - textWidth) / 2, 210);
+  u8g2gfx.print("Wait...");
+}
+
+void DrawTitleBar() {
+  tft.fillRect(0, 0, 320, TITLE_BAR_HIGHT, ILI9341_BLUE);
+  u8g2gfx.setFont(u8g2_font_t0_22b_tf);
+  u8g2gfx.setBackgroundColor(ILI9341_BLUE);
+  u8g2gfx.setForegroundColor(ILI9341_YELLOW);
+  int titleWidth = u8g2gfx.getUTF8Width(titleLine);
+  u8g2gfx.setCursor((320 - titleWidth) / 2, 24);
+  u8g2gfx.print(titleLine);
+}
+
+void DrawBattery() {
+  float v = MeasureBatteryVoltage();
+  String s = String(v, 1) + "v";
+  u8g2gfx.setFont(u8g2_font_9x18B_tf);
+  u8g2gfx.setBackgroundColor(ILI9341_BLUE);
+  u8g2gfx.setForegroundColor(ILI9341_YELLOW);
+  int w = u8g2gfx.getUTF8Width(s.c_str());
+  u8g2gfx.setCursor(320 - w - 8, 23);
+  u8g2gfx.print(s.c_str());
+}
+
+byte CalulatePageOffset(byte item) {
+  return ((item - 1) / ITEMS_PER_PAGE) * ITEMS_PER_PAGE;
+}
+
+void SetSelectedItem(byte item) {
+  selectedItem = item;
+  pageOffset = CalulatePageOffset(item);
+  prevSelectedItem = item;
+  DrawList();
+}
+
+void DisplayTreatInProgressScreen(String frequency, String seq) {
+  tft.fillScreen(ILI9341_BLACK);
+  DrawTitleBar();
+  DrawBattery();
+  u8g2gfx.setFont(u8g2_font_fub20_tr);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  u8g2gfx.setForegroundColor(ILI9341_WHITE);
+  u8g2gfx.setCursor(55, 70);
+  u8g2gfx.print("Remaining Time:");
+  if (strlen(strComplete) == 0 && frequency.length() > 0) {
+    String line = "Sequence: " + seq + "   Frequency: " + frequency + " Hz";
+    u8g2gfx.setFont(u8g2_font_helvB14_te);
+    u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+    u8g2gfx.setForegroundColor(ILI9341_GREEN);
+    int textWidth = u8g2gfx.getUTF8Width(line.c_str());
+    u8g2gfx.setCursor((320 - textWidth) / 2, 210);
+    u8g2gfx.print(line.c_str());
+  }
+  if (strlen(strComplete) > 0) {
+    u8g2gfx.setFont(u8g2_font_helvB24_te);
+    u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+    u8g2gfx.setForegroundColor(ILI9341_RED);
+    int textWidth = u8g2gfx.getUTF8Width(strComplete);
+    u8g2gfx.setCursor((320 - textWidth) / 2, 190);
+    u8g2gfx.print(strComplete);
+  }
+  // Note: Initial countdown now handled outside, with correct elapsed and forceFull=true
+}
+
+// ======OPTIMIZED COUNTDOWN (MINIMAL FLICKER) ========
+void UpdateCountdown(unsigned long elapsedMs, bool forceFull = false) {
+  static unsigned long lastUpdate = 0;
+  unsigned long totalMs = atoi(treatmentTime) * 60000UL;
+  unsigned long remainingMs = (elapsedMs >= totalMs) ? 0 : totalMs - elapsedMs;
+  int minLeft = remainingMs / 60000UL;
+  int secLeft = (remainingMs % 60000UL) / 1000;
+  char buf[6];
+  //
+  sprintf(buf, "%02d:%02d", minLeft, secLeft);
+  // Prepare large font once per call
+  u8g2gfx.setFont(u8g2_font_fub42_tf);
+  u8g2gfx.setBackgroundColor(ILI9341_BLACK);
+  u8g2gfx.setForegroundColor(ILI9341_MAGENTA);
+  // === ONE-TIME CALCULATION OF FIXED SLOT POSITIONS (digit slots use max width)
+  static bool positionsCalculated = false;
+  static int  charX[5];
+  static int  charW[5];
+  if (!positionsCalculated) {
+    positionsCalculated = true;
+    // Find widest digit (handles any proportional font safely)
+    int maxDigitW = 0;
+    for (char c = '0'; c <= '9'; c++) {
+      char tmp[2] = {c, 0};
+      int w = u8g2gfx.getUTF8Width(tmp);
+      if (w > maxDigitW) maxDigitW = w;
+    }
+    int colonW = u8g2gfx.getUTF8Width(":");
+    // Total width of the whole "MM:SS" (4 digit slots + colon slot)
+    int totalW = maxDigitW * 4 + colonW;
+    int startX = 160 - totalW / 2;   // center at x=160 (same logic as original)
+    // Build fixed slots (left-to-right)
+    int cx = startX;
+    charX[0] = cx; charW[0] = maxDigitW; cx += maxDigitW;  // tens of minutes
+    charX[1] = cx; charW[1] = maxDigitW; cx += maxDigitW;  // units of minutes
+    charX[2] = cx; charW[2] = colonW;    cx += colonW;     // colon
+    charX[3] = cx; charW[3] = maxDigitW; cx += maxDigitW;  // tens of seconds
+    charX[4] = cx; charW[4] = maxDigitW;                   // units of seconds
+  }
+  // PARTIAL UPDATE: only redraw digits that actually changed (unless forceFull)
+  static char prevBuf[6] = "99:99";  // Initial dummy value
+  //
+  for (int i = 0; i < 5; i++) {
+    if (forceFull || buf[i] != prevBuf[i]) {
+      // 1. Clear only this character slot (no full-area black flash)
+      tft.fillRect(charX[i], 96, charW[i], 45, ILI9341_BLACK);
+      // 2. Center the new character inside its slot (handles different widths)
+      char tmp[2] = {buf[i], 0};
+      int actualW = u8g2gfx.getUTF8Width(tmp);
+      int offset = (charW[i] - actualW) / 2;
+      u8g2gfx.setCursor(charX[i] + offset, 140);
+      u8g2gfx.print(tmp);
+    }
+  }
+  // Remember for next call
+  strcpy(prevBuf, buf);
+  lastUpdate = millis();
+}
+
+//
+bool GenerateFrequency() {
+  int numFreq = 0;
+  for (int i = 0; i < 10; i++) {
+    if (frequencies[10 * (selectedItem - 1) + i] > 0) numFreq++;
+  }
+  if (numFreq == 0) return false;
+
+  unsigned long fragmentMs = (atoi(treatmentTime) * 60000UL) / numFreq;
+  unsigned long sessionStart = millis();
+
+  gen.EnableOutput(true);
+  strComplete = (char*)"";
+  unsigned long lastSecond = 0;
+
+  for (int i = 0; i < numFreq; i++) {
+    unsigned long freqStart = millis();
+    intFreqToGenerate = frequencies[10 * (selectedItem - 1) + i];
+    String freqStr = String(intFreqToGenerate);
+    String seqStr  = String(i + 1);
+
+    DisplayTreatInProgressScreen(freqStr, seqStr);
+    // Immediately draw initial countdown with forceFull=true (since screen just cleared)
+    UpdateCountdown(millis() - sessionStart, true);
+
+    gen.ApplySignal(SQUARE_WAVE, REG0, intFreqToGenerate);
+
+    while ((millis() - freqStart) < fragmentMs && isGeneratingFrequency) {
+      if (btnEnterPressed) {
+        gen.EnableOutput(false);
+        return true;
+      }
+      unsigned long now = millis();
+      if (now - lastSecond >= 1000) {
+        unsigned long elapsed = now - sessionStart;
+        UpdateCountdown(elapsed);  // Normal partial update
+        lastSecond = now;
+      }
+    }
+    PlayTone(ONE_BEEP);
+  }
+
+  gen.EnableOutput(false);
+  isGeneratingFrequency = false;
+  strComplete = (char*)"Finished!";
+  PlayTone(THREE_BEEPS);
+
+  DisplayTreatInProgressScreen("", "");
+  UpdateCountdown(atoi(treatmentTime) * 60000UL, true);  // Final 00:00 with forceFull
+  delay(3000);
+
+  titleLine = (char*)"DIAGNOSES:";
+  DrawTitleBar();
+  DrawBattery();
+  DrawList();
+
+  strComplete = (char*)"";
+  digitalWrite(pinShutdown1, LOW);
+  digitalWrite(pinShutdown2, HIGH);
+
+  return false;
+}
+
+void ProcessButtonClick() {
+  if (!isGeneratingFrequency) {
+    EEPROM.update(eepromAddress, selectedItem);
+    titleLine = (char*)diagnoses[selectedItem - 1];
+    isGeneratingFrequency = true;
+    btnEnterPressed = false;
+    bool aborted = GenerateFrequency();
+    if (aborted) {
+      isGeneratingFrequency = false;
+      btnEnterPressed = false;
+      SetSelectedItem(selectedItem);
+      titleLine = (char*)"DIAGNOSES:";
+      DrawTitleBar();
+      DrawBattery();
+    }
+  } else {
+    btnEnterPressed = true;
+  }
+}
+
+void Shutdown() {
+  digitalWrite(pinShutdown1, LOW);
+  digitalWrite(pinShutdown2, HIGH);
+  isGeneratingFrequency = false;
+  btnEnterPressed = false;
+  debugln("Shutdown initiated");
+}
+
+// ===== ENCODER / BUTTON ======
+void OnScrollChange() {
+  encoderMoved = true;
+}
+
+int8_t AnalyzeEncoderChange() {
+  encoderMoved = false;
+  static uint8_t prev_AB = 0b00000011;
+  static int8_t  encoderVal = 0;
+  uint8_t A = digitalRead(pinEncoderCW);
+  uint8_t B = digitalRead(pinEncoderCCW);
+  uint8_t current_AB = (A << 1) | B;
+  uint8_t transition = (prev_AB << 2) | current_AB;
+  static const int8_t deltaTable[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
+  int8_t delta = deltaTable[transition];
+  encoderVal += delta;
+  int8_t result = 0;
+  if (encoderVal <= -4) { result = -1; encoderVal = 0; }
+  if (encoderVal >=  4) { result =  1; encoderVal = 0; }
+  if (encoderVal <= -2) { result = -1; encoderVal += 2; }
+  if (encoderVal >=  2) { result =  1; encoderVal -= 2; }
+  prev_AB = current_AB;
+  if (result != 0) {
+    debug("Step: "); debug(result);
+    debug("  AB: "); debug(current_AB);
+    debug("  encVal: "); debugln(encoderVal);
+  }
+  return result;
+}
+
+void OnButtonPress() {
+  int buttonState;
+  static int lastButtonStatus = HIGH;
+  static unsigned long longTime = 0ul;
+  static unsigned long shortTime = 0ul;
+
+  buttonState = digitalRead(pinBtnEnter);
+  boolean timeoutShort = (millis() > shortTime);
+  boolean timeoutLong  = (millis() > longTime);
+
+  if (buttonState != lastButtonStatus) {
+      shortTime = millis() + DEBOUNCE_DELTA;
+      longTime  = millis() + LONG_DELTA;
+  }
+
+  boolean buttonStateChange = (buttonState != lastButtonStatus);
+  boolean buttonReleased = (buttonStateChange && (buttonState == HIGH));
+  lastButtonStatus = buttonState;
+
+  if (!buttonStateChange) {
+       buttonOutput = STATE_NORMAL | buttonOutput;
+       return;
+  }
+
+  if (timeoutLong && buttonReleased) {
+      buttonOutput = STATE_LONG | buttonOutput;
+      btnEnterPressed = true;
+  } else if (timeoutShort && buttonReleased) {
+      buttonOutput = STATE_SHORT | buttonOutput;
+      btnEnterPressed = true;
+  } else {
+      buttonOutput = STATE_NORMAL | buttonOutput;
+      btnEnterPressed = false;
+  }
+}
+
+void DrawIntroFrame() {
+  tft.fillRoundRect(FRAME_X, FRAME_Y, FRAME_W, FRAME_H, 24, GOLD1);
+  tft.drawRoundRect(FRAME_X+5, FRAME_Y+5, FRAME_W-10, FRAME_H-10, 18, GOLD3);
+  tft.drawRoundRect(FRAME_X+12, FRAME_Y+12, FRAME_W-24, FRAME_H-24, 12, GOLD4);
+  for (int i = 0; i < 20; i++) {
+    tft.drawPixel(FRAME_X+12+i, FRAME_Y+12+sin(i*0.4)*8, GOLD2);
+    tft.drawPixel(FRAME_X+FRAME_W-12-i, FRAME_Y+12+sin(i*0.4)*8, GOLD2);
+    tft.drawPixel(FRAME_X+12+i, FRAME_Y+FRAME_H-12-sin(i*0.4)*8, GOLD2);
+    tft.drawPixel(FRAME_X+FRAME_W-12-i, FRAME_Y+FRAME_H-12-sin(i*0.4)*8, GOLD2);
+  }
+  tft.fillRoundRect(FRAME_X+20, FRAME_Y+20, FRAME_W-40, FRAME_H-40, 8, ILI9341_BLACK);
+}
+
+void DrawGoldenCrown(int cx, int topY) {
+  const int w = 52;
+  const int h = 28;
+  const int baseH = 8;
+  int x0 = cx - w / 2;
+  int y0 = topY;
+  tft.fillRoundRect(x0, y0 + h - baseH, w, baseH, baseH / 3, GOLD3);
+  tft.drawRoundRect(x0, y0 + h - baseH, w, baseH, baseH / 3, GOLD1);
+  tft.drawFastHLine(x0 + 3, y0 + h - baseH, w - 6, GOLD4);
+  tft.drawFastHLine(x0 + 2, y0 + h - 1, w - 4, GOLD2);
+  for (int i = 0; i < 5; i++) {
+    int gemX = x0 + w * (i + 1) / 6;
+    int gemY = y0 + h - baseH / 2;
+    tft.fillCircle(gemX, gemY, baseH / 3, GOLD1);
+    tft.drawCircle(gemX, gemY, baseH / 3, GOLD4);
+  }
+  int peakBaseY = y0 + h - baseH;
+  int leftX   = x0 + w / 4;
+  int centerX = cx;
+  int rightX  = x0 + 3 * w / 4;
+  int leftH   = 12;
+  int centerH = 16;
+  int rightH  = 12;
+  tft.fillTriangle(leftX, peakBaseY, leftX - 6, peakBaseY - leftH, leftX + 6, peakBaseY - leftH, GOLD2);
+  tft.fillCircle(leftX, peakBaseY - leftH - 2, 3, GOLD4);
+  tft.drawCircle(leftX, peakBaseY - leftH - 2, 3, GOLD1);
+  tft.fillTriangle(rightX, peakBaseY, rightX - 6, peakBaseY - rightH, rightX + 6, peakBaseY - rightH, GOLD2);
+  tft.fillCircle(rightX, peakBaseY - rightH - 2, 3, GOLD4);
+  tft.drawCircle(rightX, peakBaseY - rightH - 2, 3, GOLD1);
+  tft.fillTriangle(centerX, peakBaseY, centerX - 8, peakBaseY - centerH, centerX + 8, peakBaseY - centerH, GOLD1);
+  int crossX = centerX;
+  int crossY = peakBaseY - centerH - 3;
+  tft.drawLine(crossX, crossY - 3, crossX, crossY + 3, GOLD4);
+  tft.drawLine(crossX - 3, crossY, crossX + 3, crossY, GOLD4);
+  tft.fillCircle(crossX, crossY, 2, GOLD3);
+  for (int i = 0; i <= 12; i++) {
+    float t = i / 12.0;
+    int x = leftX + t * (centerX - leftX);
+    int y = peakBaseY - leftH * (1 - t) - centerH * t + 4 * sin(t * PI);
+    tft.drawPixel(x, y, GOLD2);
+  }
+  for (int i = 0; i <= 12; i++) {
+    float t = i / 12.0;
+    int x = centerX + t * (rightX - centerX);
+    int y = peakBaseY - centerH * (1 - t) - rightH * t + 4 * sin(t * PI);
+    tft.drawPixel(x, y, GOLD2);
+  }
+  tft.drawPixel(leftX - 3, peakBaseY - leftH / 2, GOLD4);
+  tft.drawPixel(rightX + 3, peakBaseY - rightH / 2, GOLD4);
+  tft.drawPixel(centerX, peakBaseY - centerH + 2, GOLD4);
+}
+
+float MeasureBatteryVoltage() {
+  int raw = analogRead(pinBatteryLevel);
+  float voltage = (raw * referenceVoltage) / 1024.0;
+  return voltage / (R2 / (R1 + R2));
+}
+
+void PlayTone(int n) {
+  for (int i = 0; i < n; i++) {
+    tone(pinBeepOut, PIEZO_BEEP_TONE, PEIZO_BEEP_LENGTH);
+    delay(PEIZO_BEEP_LENGTH);
+    noTone(pinBeepOut);
+    delay(PEIZO_BEEP_PAUSE);
+  }
+}
+*/
