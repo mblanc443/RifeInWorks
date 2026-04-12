@@ -391,7 +391,6 @@ void DrawTitleBar() {
   u8g2gfx.print(titleLine);
 }
 
-
 void DrawBattery() {
   float v = MeasureBatteryVoltage();
   String s = String(v, 1) + "v";
@@ -403,14 +402,12 @@ void DrawBattery() {
   u8g2gfx.print(s.c_str());
 }
 
-
 void SetSelectedItem(byte item) {
   selectedItem = item;
   pageOffset = CalulatePageOffset(item);
   prevSelectedItem = item;
   DrawList();
 }
-
 
 void DisplayTreatInProgressScreen(String frequency, String seq) {
   tft.fillScreen(ILI9341_BLACK);
@@ -439,7 +436,6 @@ void DisplayTreatInProgressScreen(String frequency, String seq) {
     u8g2gfx.print(strComplete);
   }
 }
-
 
 void DrawList() {
   tft.fillRect(0, TITLE_BAR_HIGHT, 320, 240 - TITLE_BAR_HIGHT, ILI9341_BLACK); 
